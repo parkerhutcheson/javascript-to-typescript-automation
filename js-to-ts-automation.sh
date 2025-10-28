@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 # Configuration
 OPENAI_API_KEY="${OPENAI_API_KEY}"
 API_ENDPOINT="https://api.openai.com/v1/responses"
-MODEL="${OPENAI_MODEL:-gpt-5-2025-08-07}"
+MODEL="${OPENAI_MODEL:-gpt-5}"
 MAX_RETRIES=3
 RETRY_DELAY=2
 BACKUP_DIR=".js-to-ts-backup-$(date +%Y%m%d-%H%M%S)"
@@ -172,8 +172,7 @@ ${file_content}"
         local json_payload=$(cat <<EOF
 {
   "model": "$MODEL",
-  "input": $escaped_prompt,
-  "max_output_tokens": 4000
+  "input": $escaped_prompt
 }
 EOF
 )
@@ -190,8 +189,9 @@ EOF
             local status=$(echo "$body" | jq -r '.status')
             
             if [ "$status" = "completed" ]; then
-                # Extract text from the response format
-                local content=$(echo "$body" | jq -r '.output[0].content[0].text')
+                # Extract text from the correct response format
+                # The response structure is: output[0].content[0].text
+                local content=$(echo "$body" | jq -r '.output[0].content[0].text // empty')
                 
                 if [ -n "$content" ] && [ "$content" != "null" ]; then
                     # Remove markdown code blocks if present
@@ -200,9 +200,10 @@ EOF
                     return 0
                 else
                     log_message "Warning: Empty response for $file_path (attempt $attempt)"
+                    log_message "Response body: $body"
                 fi
             elif [ "$status" = "failed" ]; then
-                local error=$(echo "$body" | jq -r '.error')
+                local error=$(echo "$body" | jq -r '.error // "Unknown error"')
                 log_message "Error: API call failed for $file_path - $error (attempt $attempt)"
             else
                 log_message "Warning: Unexpected status '$status' for $file_path (attempt $attempt)"
@@ -212,7 +213,8 @@ EOF
             sleep $((RETRY_DELAY * attempt))
         else
             log_message "Error: API call failed for $file_path (HTTP $http_code, attempt $attempt)"
-            log_message "Response: $body"
+            local error_msg=$(echo "$body" | jq -r '.error.message // .error // "Unknown error"')
+            log_message "Error message: $error_msg"
         fi
         
         attempt=$((attempt + 1))
