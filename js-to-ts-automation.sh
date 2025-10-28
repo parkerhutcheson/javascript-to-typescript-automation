@@ -190,8 +190,8 @@ EOF
             
             if [ "$status" = "completed" ]; then
                 # Extract text from the correct response format
-                # The response structure is: output[0].content[0].text
-                local content=$(echo "$body" | jq -r '.output[0].content[0].text // empty')
+                # The response structure is: output[1].content[0].text
+                local content=$(echo "$body" | jq -r '.output[1].content[0].text // empty')
                 
                 if [ -n "$content" ] && [ "$content" != "null" ]; then
                     # Remove markdown code blocks if present
