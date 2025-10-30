@@ -36,9 +36,9 @@ print_color() {
     echo -e "${color}$@${NC}"
 }
 
-# Function to log messages
+# Function to log messages (only to file, not stdout)
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
 # Function to check prerequisites
@@ -136,6 +136,28 @@ EOF
     fi
 }
 
+# Function to validate TypeScript code
+validate_typescript_code() {
+    local content="$1"
+    
+    # Check if content is empty
+    if [ -z "$content" ]; then
+        return 1
+    fi
+    
+    # Check if content contains log messages or error artifacts
+    if echo "$content" | grep -q "^\[2025-.*\] Error:"; then
+        return 1
+    fi
+    
+    # Check if it looks like actual code (has at least some typical code patterns)
+    if ! echo "$content" | grep -qE "(import|export|function|const|let|var|class|interface|type)"; then
+        return 1
+    fi
+    
+    return 0
+}
+
 # Function to call OpenAI Responses API with retry logic
 call_openai_api() {
     local file_path="$1"
@@ -148,24 +170,24 @@ call_openai_api() {
         file_extension="tsx"
     fi
     
-    local prompt="You are an expert TypeScript converter. Convert the following JavaScript${is_jsx:+ React} code to TypeScript.
+    local prompt="Convert this JavaScript${is_jsx:+ React} code to TypeScript. Follow these rules:
 
-CRITICAL REQUIREMENTS:
-1. Return ONLY the converted TypeScript code - no explanations, no markdown, no backticks
-2. Convert all .js imports to .ts and .jsx imports to .tsx
-3. Add type annotations using 'any' or 'unknown' where types are unclear
-4. Add interfaces for props and state (use 'any' for properties if needed)
-5. Maintain exact functionality - only add types, do not refactor
-6. Keep all comments and code structure identical
-7. Use React.FC or standard function components for React components
-8. The response must be valid TypeScript code that can be directly saved to a file
+1. Output ONLY valid TypeScript code - no explanations, markdown, or code blocks
+2. Use minimal typing - prefer 'any' for unclear types rather than complex inference
+3. Add basic interface definitions for props/state using 'any' for properties if needed
+4. Keep exact same functionality - only add necessary type annotations
+5. Preserve all comments and code structure
+6. Update imports: .js → .ts, .jsx → .tsx
+7. For React components, use simple function declarations with basic prop types
+8. Do not refactor or reorganize code
+9. Start output immediately with code - no preamble
 
-File: ${file_path}
-
-Code to convert:
+Code:
 ${file_content}"
     
     while [ $attempt -le $MAX_RETRIES ]; do
+        log_message "Attempting conversion of $file_path (attempt $attempt/$MAX_RETRIES)"
+        
         # Escape the prompt for JSON
         local escaped_prompt=$(echo "$prompt" | jq -Rs .)
         
@@ -177,44 +199,64 @@ ${file_content}"
 EOF
 )
         
-        local response=$(curl -s -w "\n%{http_code}" "$API_ENDPOINT" \
+        # Make API call and capture response
+        local temp_response="$TEMP_DIR/response_${RANDOM}.txt"
+        local http_code=$(curl -s -w "%{http_code}" "$API_ENDPOINT" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -d "$json_payload")
+            -d "$json_payload" \
+            -o "$temp_response")
         
-        local http_code=$(echo "$response" | tail -n1)
-        local body=$(echo "$response" | sed '$d')
+        local body=$(cat "$temp_response" 2>/dev/null || echo "")
+        rm -f "$temp_response"
+        
+        # Check if curl command succeeded
+        if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+            log_message "Network error for $file_path (attempt $attempt) - curl failed"
+            attempt=$((attempt + 1))
+            if [ $attempt -le $MAX_RETRIES ]; then
+                sleep $RETRY_DELAY
+            fi
+            continue
+        fi
         
         if [ "$http_code" -eq 200 ]; then
-            local status=$(echo "$body" | jq -r '.status')
+            local status=$(echo "$body" | jq -r '.status // empty')
             
             if [ "$status" = "completed" ]; then
-                # Extract text from the correct response format
-                # The response structure is: output[1].content[0].text
+                # Extract text from the response
                 local content=$(echo "$body" | jq -r '.output[1].content[0].text // empty')
                 
                 if [ -n "$content" ] && [ "$content" != "null" ]; then
-                    # Remove markdown code blocks if present
-                    content=$(echo "$content" | sed 's/^```[a-z]*$//' | sed 's/^```$//' | sed '/^$/d')
-                    echo "$content"
-                    return 0
+                    # Clean up any markdown code blocks
+                    content=$(echo "$content" | sed -E '/^```[a-z]*$/d' | sed '/^```$/d')
+                    
+                    # Validate the content
+                    if validate_typescript_code "$content"; then
+                        echo "$content"
+                        log_message "Successfully converted $file_path"
+                        return 0
+                    else
+                        log_message "Invalid TypeScript output for $file_path (attempt $attempt)"
+                    fi
                 else
-                    log_message "Warning: Empty response for $file_path (attempt $attempt)"
-                    log_message "Response body: $body"
+                    log_message "Empty response for $file_path (attempt $attempt)"
                 fi
             elif [ "$status" = "failed" ]; then
-                local error=$(echo "$body" | jq -r '.error // "Unknown error"')
-                log_message "Error: API call failed for $file_path - $error (attempt $attempt)"
+                local error=$(echo "$body" | jq -r '.error.message // .error // "Unknown error"')
+                log_message "API returned failed status for $file_path: $error (attempt $attempt)"
             else
-                log_message "Warning: Unexpected status '$status' for $file_path (attempt $attempt)"
+                log_message "Unexpected API status '$status' for $file_path (attempt $attempt)"
             fi
         elif [ "$http_code" -eq 429 ]; then
-            log_message "Rate limit hit for $file_path (attempt $attempt), waiting..."
-            sleep $((RETRY_DELAY * attempt))
+            log_message "Rate limit hit for $file_path (attempt $attempt)"
+            sleep $((RETRY_DELAY * attempt * 2))
+        elif [ "$http_code" -eq 401 ]; then
+            log_message "Authentication failed for $file_path - check API key"
+            return 1
         else
-            log_message "Error: API call failed for $file_path (HTTP $http_code, attempt $attempt)"
-            local error_msg=$(echo "$body" | jq -r '.error.message // .error // "Unknown error"')
-            log_message "Error message: $error_msg"
+            local error_msg=$(echo "$body" | jq -r '.error.message // .error // "Unknown error"' 2>/dev/null || echo "Unknown error")
+            log_message "API error for $file_path (HTTP $http_code, attempt $attempt): $error_msg"
         fi
         
         attempt=$((attempt + 1))
@@ -223,6 +265,7 @@ EOF
         fi
     done
     
+    log_message "Failed to convert $file_path after $MAX_RETRIES attempts"
     return 1
 }
 
@@ -233,14 +276,15 @@ convert_file() {
     local dir_name=$(dirname "$file_path")
     
     print_color "$BLUE" "Converting: $file_path"
-    log_message "Converting: $file_path"
+    log_message "Starting conversion: $file_path"
     
     # Read file content
     local file_content=$(cat "$file_path")
     
     # Check if file is empty
     if [ -z "$file_content" ]; then
-        print_color "$YELLOW" "Skipping empty file: $file_path"
+        print_color "$YELLOW" "⊘ Skipping empty file: $file_path"
+        log_message "Skipped empty file: $file_path"
         SKIPPED_FILES=$((SKIPPED_FILES + 1))
         return
     fi
@@ -255,8 +299,17 @@ convert_file() {
     
     # Call OpenAI API
     local converted_content=$(call_openai_api "$file_path" "$file_content" "$is_jsx")
+    local api_result=$?
     
-    if [ $? -eq 0 ] && [ -n "$converted_content" ]; then
+    if [ $api_result -eq 0 ] && [ -n "$converted_content" ]; then
+        # Validate the converted content one more time
+        if ! validate_typescript_code "$converted_content"; then
+            print_color "$RED" "✗ Invalid conversion output, keeping original: $file_path"
+            log_message "Invalid conversion output for: $file_path"
+            FAILED_FILES=$((FAILED_FILES + 1))
+            return
+        fi
+        
         # Determine new file extension
         local new_extension="ts"
         if [ "$is_jsx" = "true" ]; then
@@ -271,18 +324,30 @@ convert_file() {
         local temp_file="$TEMP_DIR/$new_file_path"
         echo "$converted_content" > "$temp_file"
         
-        # Move temp file to final location
-        mv "$temp_file" "$new_file_path"
-        
-        # Remove old JS/JSX file
-        rm "$file_path"
-        
-        print_color "$GREEN" "✓ Converted: $file_path -> $new_file_path"
-        log_message "Successfully converted: $file_path -> $new_file_path"
-        CONVERTED_FILES=$((CONVERTED_FILES + 1))
+        # Verify the temp file was created and has content
+        if [ -f "$temp_file" ] && [ -s "$temp_file" ]; then
+            # Move temp file to final location
+            mv "$temp_file" "$new_file_path"
+            
+            # Remove old JS/JSX file only after successful creation of new file
+            if [ -f "$new_file_path" ]; then
+                rm "$file_path"
+                print_color "$GREEN" "✓ Converted: $file_path → $new_file_path"
+                log_message "Successfully converted: $file_path → $new_file_path"
+                CONVERTED_FILES=$((CONVERTED_FILES + 1))
+            else
+                print_color "$RED" "✗ Failed to create new file, keeping original: $file_path"
+                log_message "Failed to create new file: $new_file_path"
+                FAILED_FILES=$((FAILED_FILES + 1))
+            fi
+        else
+            print_color "$RED" "✗ Failed to write converted content, keeping original: $file_path"
+            log_message "Failed to write temp file for: $file_path"
+            FAILED_FILES=$((FAILED_FILES + 1))
+        fi
     else
-        print_color "$RED" "✗ Failed to convert: $file_path"
-        log_message "Failed to convert: $file_path"
+        print_color "$YELLOW" "⊘ Failed to convert, keeping original: $file_path"
+        log_message "Conversion failed, file unchanged: $file_path"
         FAILED_FILES=$((FAILED_FILES + 1))
     fi
 }
@@ -299,13 +364,14 @@ update_imports() {
         ! -path "*/$BACKUP_DIR/*" \
         ! -path "*/$TEMP_DIR/*" | while read -r file; do
         
-        # Update .js imports to .ts
-        sed -i '' -E "s/from ['\"]([^'\"]+)\.js['\"]/from '\1.ts'/g" "$file" 2>/dev/null || \
-        sed -i -E "s/from ['\"]([^'\"]+)\.js['\"]/from '\1.ts'/g" "$file" 2>/dev/null || true
-        
-        # Update .jsx imports to .tsx
-        sed -i '' -E "s/from ['\"]([^'\"]+)\.jsx['\"]/from '\1.tsx'/g" "$file" 2>/dev/null || \
-        sed -i -E "s/from ['\"]([^'\"]+)\.jsx['\"]/from '\1.tsx'/g" "$file" 2>/dev/null || true
+        # Update .js imports to .ts (macOS and Linux compatible)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' -E "s/from ['\"]([^'\"]+)\.js['\"]/from '\1.ts'/g" "$file" 2>/dev/null || true
+            sed -i '' -E "s/from ['\"]([^'\"]+)\.jsx['\"]/from '\1.tsx'/g" "$file" 2>/dev/null || true
+        else
+            sed -i -E "s/from ['\"]([^'\"]+)\.js['\"]/from '\1.ts'/g" "$file" 2>/dev/null || true
+            sed -i -E "s/from ['\"]([^'\"]+)\.jsx['\"]/from '\1.tsx'/g" "$file" 2>/dev/null || true
+        fi
     done
     
     log_message "Import statements updated"
@@ -412,8 +478,8 @@ main() {
     print_color "$BLUE" "Log file: $LOG_FILE"
     
     if [ $FAILED_FILES -gt 0 ]; then
-        print_color "$RED" "Warning: $FAILED_FILES files failed to convert. Check $LOG_FILE for details."
-        exit 1
+        print_color "$YELLOW" "Note: $FAILED_FILES files failed to convert and were left as .js/.jsx files."
+        print_color "$YELLOW" "Check $LOG_FILE for details on which files failed."
     fi
 }
 
